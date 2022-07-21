@@ -46,6 +46,8 @@ class GeneOntology:
     def __init__(self, obo:str, verbose: bool=True):
         self._obo = obo
         self._terms: Dict = {}
+        # a convenient list of tuples for faster up-propagation calculation
+        self._parents: List = []
         # a cache of the aliases to speed-up access
         self._alias_map: Dict = {}
         self._verbose = verbose
@@ -114,6 +116,10 @@ class GeneOntology:
                     split_relation = relationship.value.split()
                     if split_relation[0] == "part_of":
                         self.find_term(go_id).add_relation(self.find_term(split_relation[1]), "part_of")
+
+    def build_structure_matrix():
+        self.go_parents = []
+        for term in self._terms
 
     def load_gaf_file(self, gaf_file: str, organism_name: str,
                       evidence_codes: List[str]=EXPERIMENTAL_EVIDENCE_CODES,
