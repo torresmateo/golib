@@ -4,6 +4,9 @@ from golib.core.goterm import GOTerm
 from typing import Dict, List
 from rich.progress import track
 import pandas as pd
+import networkx as nx
+import numpy as np
+import numpy.typing as npt
 
 
 class GeneOntology:
@@ -47,7 +50,9 @@ class GeneOntology:
         self._obo = obo
         self._terms: Dict = {}
         # a convenient list of tuples for faster up-propagation calculation
-        self._parents: List = []
+        self._closure_nodes: npt.NDArray
+        self._closure: npt.NDArray 
+        self._closure_calculated: bool = False
         # a cache of the aliases to speed-up access
         self._alias_map: Dict = {}
         self._verbose = verbose
@@ -78,7 +83,6 @@ class GeneOntology:
         """
         obo_parser = OboParser(self._obo)
         stanzas = []
-        print("")
         for stanza in obo_parser:
             if stanza.name != "Term":
                 continue
@@ -117,9 +121,21 @@ class GeneOntology:
                     if split_relation[0] == "part_of":
                         self.find_term(go_id).add_relation(self.find_term(split_relation[1]), "part_of")
 
-    def build_structure_matrix():
-        self.go_parents = []
-        for term in self._terms
+    def calculate_dag_closure(self,
+                              relations: List[str]=GOTerm.SUPPORTED_RELATIONS) -> None:
+        """
+        Calculates and stores the transitive closure for later up-propagation
+        without relying on recursively DAG traversal.
+        """
+        DG = nx.DiGraph()
+        all_pairs = []
+        for go_id, term in self._terms.items():
+            for parent in term.parents(relations=relations):
+                all_pairs.append((go_id, parent.go_id))
+        DG.add_edges_from(all_pairs)
+        self._closure_nodes = np.array(DG)
+        closure = nx.transitive_closure_dag(DG)
+        self._closure = nx.adjacency_matrix(closure)
 
     def load_gaf_file(self, gaf_file: str, organism_name: str,
                       evidence_codes: List[str]=EXPERIMENTAL_EVIDENCE_CODES,
@@ -172,8 +188,56 @@ class GeneOntology:
                     skip_counter["term_not_found"] += 1
         return skip_counter
 
+    def up_propagate_closure(self, organism_name: str,
+                             relations: List[str]=GOTerm.SUPPORTED_RELATIONS,
+                             same_domain: bool = False) -> None:
+        if same_domain:
+            raise NotImplementedError
+        if not self._closure_calculated:
+            self.calculate_dag_closure(relations=relations)
+        annotations = []
+        proteins = set()
+        for term in self._terms.values():
+            if organism_name in term.annotations:
+                for protein, score in term.annotations[organism_name].items():
+                    proteins.add(protein)
+                    annotations.append((protein, term.go_id, score))
+        proteins = np.array(list(proteins))
+        prot_idx = {p:i for i,p in enumerate(proteins)}
+        term_idx = {t:i for i,t in enumerate(self._closure_nodes)}
+        A = np.zeros((len(annotations), len(self._closure_nodes)))
+        g = {p:[] for p in proteins}
+        for i, (p, t, s) in enumerate(annotations):
+            g[p].append(i)
+            A[i, term_idx[t]] = s
+        Aexpanded = A @ self._closure + A
+        Aup = np.zeros((len(proteins), len(self._closure_nodes)))
+        for p in proteins:
+            Aup[prot_idx[p]] = Aexpanded[g[p]].max(axis=0)
+        prot, term = Aup.nonzero()
+        for i in range(len(prot)):
+            t= self.find_term(self._closure_nodes[term[i]])
+            t.annotations[organism_name][proteins[prot[i]]] = Aup[prot[i], term[i]]
+
+    def up_propagate_recursive(self, organism_name: str,
+                                           relations: List[str]=GOTerm.SUPPORTED_RELATIONS,
+                                           same_domain: bool = True) -> None:
+        annotated_terms = set()
+        # get annotated terms
+        for term in self._terms.values():
+            if organism_name in term.annotations:
+                annotated_terms.add(term)
+
+        # up-propagate
+        for term in annotated_terms:
+            term.up_propagate_annotations(organism_name, 
+                                          relations=relations, 
+                                          same_domain=same_domain)
+
     def up_propagate_annotations(self, organism_name: str,
-                                 relations: List[str]=GOTerm.SUPPORTED_RELATIONS) -> None:
+                                 relations: List[str]=GOTerm.SUPPORTED_RELATIONS,
+                                 same_domain: bool = False, 
+                                 strategy:str = "recursive") -> None:
         """
         Up-propagate all annotations within an annoatation set
 
@@ -183,20 +247,31 @@ class GeneOntology:
             annotation set
         relations : list of str
             the set of relations that will be considered.
-
+        same_domain : bool
+            If true, up-propagation will be restricted to terms of the same domain.
+        strategy : str, default "recursive"
+            Which procedure is used to calculate the up-propagation.
+            "recursive" iterates over all the annotations of the organism and recursively
+                traverses teh DAG.
+            "closure" uses (or calculates) the transitive closure of the DAG and up-propagates
+                with a matrix multiplication. This option may be faster for large amounts of
+                annotations.
         Notes
         -----
         All relations are assumed to be transitive.
         """
-        annotated_terms = set()
-        # get annotated terms
-        for term in self._terms.values():
-            if organism_name in term.annotations:
-                annotated_terms.add(term)
+        match strategy:
+            case "recursive":
+                self.up_propagate_recursive(organism_name,
+                                            relations=relations,
+                                            same_domain=same_domain)
+            case "closure":
+               self.up_propagate_closure(organism_name,
+                                          relations=relations,
+                                          same_domain=same_domain)
+            case _:
+                raise NotImplementedError
 
-        # up-propagate
-        for term in track(annotated_terms, description="Up-propagating recursively..."):
-            term.up_propagate_annotations(organism_name, relations=relations)
                     
     def annotations(self, organism_name: str) -> pd.DataFrame:
         d = {k: [] for k in ["GO ID", "Protein", "Score"]}
